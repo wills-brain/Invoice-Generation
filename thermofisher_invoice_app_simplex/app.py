@@ -1,0 +1,1293 @@
+from __future__ import annotations
+
+import io
+import re
+import tempfile
+import zipfile
+from dataclasses import dataclass, asdict
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import fitz  # PyMuPDF
+import pandas as pd
+import streamlit as st
+from docxtpl import DocxTemplate
+from docx import Document
+from docx.shared import Pt, Inches
+
+try:
+    import pytesseract
+    from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+except Exception:
+    pytesseract = None
+    Image = None
+    ImageOps = None
+    ImageFilter = None
+    ImageEnhance = None
+
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_TEMPLATE = APP_DIR / "simplex_invoice_template.docx"
+BRAND_LOGO = APP_DIR / "simplex_logo_navy.png"
+APP_VERSION = "1.3.9"
+APP_PASSCODE = "simplexlovesdads"
+
+MONEY_RE = r"(?:\$\s*)?[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})|(?:\$\s*)?[0-9]+(?:\.[0-9]{2})"
+
+SENDER_DEFAULTS = {
+    "company_name": "Simplex Sciences",
+    "company_address": "206 Elm Street\nPO Box 206602\nNew Haven, CT\n06520 United States",
+    "company_email": "contact@simplexsciences.com",
+    "company_phone": "+1 (510) 847-9188",
+    "bank_name": "Wells Fargo",
+    "account_number": "7462713764",
+    "direct_deposit_routing": "021101108",
+    "wire_routing": "121000248",
+    "swift_code": "WFBIUS6S",
+}
+
+THERMO_BILL_TO_DEFAULT = "Fisher Scientific\nP.O. Box 1768\nPittsburgh, PA 15230\nEmail: APFax@thermofisher.com"
+
+
+@dataclass
+class ParsedPO:
+    invoice_issued_to: str = "Fisher Scientific"
+    issue_date: str = ""
+    order_number: str = ""
+    shipping_date: str = ""
+    sales_rep: str = ""
+    customer_po_number: str = ""
+    tracking_number: str = ""
+    bill_to: str = ""
+    ship_to: str = ""
+    total: str = ""
+    currency: str = "USD"
+    source_file: str = ""
+    line_items: list[dict[str, str]] | None = None
+    raw_text: str = ""
+    ocr_rotation_used: str = ""
+
+
+def clean_money(value: Any, with_symbol: bool = True) -> str:
+    raw = str(value or "").strip().replace(" ", "")
+    if not raw:
+        return ""
+    raw = raw.replace("$", "")
+    try:
+        num = float(raw.replace(",", ""))
+        return f"${num:,.2f}" if with_symbol else f"{num:.2f}"
+    except ValueError:
+        return ("$" + raw) if with_symbol and not raw.startswith("$") else raw
+
+
+def money_to_float(value: Any) -> float:
+    raw = str(value or "").replace("$", "").replace(",", "").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def safe_filename(name: str) -> str:
+    base = Path(str(name)).stem or "invoice"
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
+    return base[:80] or "invoice"
+
+
+def normalize_ocr_text(text: str) -> str:
+    replacements = {
+        "Selontitic": "Scientific",
+        "SelenBlte": "Scientific",
+        "Selentific": "Scientific",
+        "Therno": "Thermo",
+        "Pittsburgh, PA 18230": "Pittsburgh, PA 15230",
+        "Pittsburgh PA 18230": "Pittsburgh, PA 15230",
+        "HEW HAVEN": "NEW HAVEN",
+        "HET CONTACT": "MET CONTACT",
+        "INSTRICTIONS": "INSTRUCTIONS",
+        "INSTRICTIONS xxx": "INSTRUCTIONS ***",
+        "EMANLORMAN": "EMAIL OR MAIL",
+        "APFax@thermofishercom": "APFax@thermofisher.com",
+        "APVendor@thermofishercom": "APVendor@thermofisher.com",
+        "FO. Box": "P.O. Box",
+        "P.O Box": "P.O. Box",
+        "PO. Box": "P.O. Box",
+        "UREFF": "REF#",
+        "UREF#": "REF#",
+        "IREF#": "REF#",
+        "THC": "INC",
+        "GRAIL THC": "GRAIL INC",
+        "ss50": "SS50",
+        "ss5o": "SS50",
+        "DHA LADDER": "DNA LADDER",
+        "DHA LADOER": "DNA LADDER",
+        "TADDER": "LADDER",
+    }
+    out = text
+    for old, new in replacements.items():
+        out = out.replace(old, new)
+    # Normalize weird vertical separators but preserve line breaks.
+    out = out.replace("\u2014", "-").replace("\u2013", "-")
+    return out
+
+
+def score_thermo_text(text: str) -> int:
+    low = text.lower()
+    terms = ["purchase order", "fisher", "scientific", "supplier", "ship to", "invoice", "payable", "quantity", "unit cost", "extended", "dna ladder"]
+    return sum(3 if term in low else 0 for term in terms) + min(len(text) // 200, 10)
+
+
+def extract_text_from_pdf(file_bytes: bytes, enable_ocr: bool = True) -> tuple[str, str]:
+    """Return extracted text and the rotation used for OCR, if any."""
+    with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+        text_parts = [(page.get_text("text") or "") for page in pdf]
+        extracted = "\n".join(text_parts).strip()
+        if score_thermo_text(extracted) >= 9:
+            return normalize_ocr_text(extracted), "text-layer"
+
+        if not enable_ocr or pytesseract is None or Image is None:
+            return normalize_ocr_text(extracted), "text-layer/ocr-off"
+
+        all_page_text = []
+        rotations = []
+        for page in pdf:
+            pix = page.get_pixmap(dpi=250)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            candidates: list[tuple[int, str, int]] = []
+            for angle in [0, 90, 180, 270]:
+                rotated = img.rotate(angle, expand=True)
+                try:
+                    txt = pytesseract.image_to_string(rotated, config="--psm 6")
+                except Exception:
+                    txt = ""
+                txt = normalize_ocr_text(txt)
+                candidates.append((score_thermo_text(txt), txt, angle))
+            score, txt, angle = max(candidates, key=lambda x: x[0])
+            all_page_text.append(txt)
+            rotations.append(str(angle))
+        return "\n".join(all_page_text).strip(), ",".join(rotations)
+
+
+def extract_filename_po(filename: str) -> str:
+    m = re.search(r"(\d{5,})", Path(filename).stem)
+    return m.group(1) if m else ""
+
+
+def find_purchase_order_number(text: str, filename: str) -> str:
+    """Return the Thermo/Fisher PO number, usually the uploaded PDF filename."""
+    from_filename = extract_filename_po(filename)
+    patterns = [
+        r"Purchase\s+Order\s+Number\s*[:#-]?\s*([A-Z0-9-]{5,})",
+        r"Customer\s+Purchase\s+Order\s+Number\s*[:#-]?\s*([A-Z0-9-]{5,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            candidate = m.group(1).strip()
+            if not re.search(r"scientific|order|number", candidate, re.I):
+                return candidate
+    return from_filename
+
+
+def clean_order_token(token: str) -> str:
+    token = re.sub(r"[^A-Z0-9-]", "", str(token or "").upper())
+    return token.strip("-_")
+
+
+def normalize_fisher_order_candidate(raw: str) -> str:
+    """Normalize a candidate Fisher Scientific Order Number to ``DR<digits>``.
+
+    Conservative on purpose: only character-level OCR digit confusions
+    (``O→0, I→1, L→1, B→8, S→5, Z→2``) are applied. Multi-character "lookup"
+    rewrites (e.g. ``5A0→340``) are deliberately omitted because they have
+    invented DR values out of unrelated nearby garbage in past PDFs.
+    """
+    raw_text = str(raw or "").upper()
+    token = re.sub(r"[^A-Z0-9]", "", raw_text)
+    if not token:
+        return ""
+
+    # Normalize the leading ``DR`` prefix from common OCR variants.
+    if token.startswith(("DBS", "D8S", "D5S")):
+        token = "DR5" + token[3:]
+    else:
+        for prefix in ("DBR", "D8R", "DER", "DPR", "DRS", "D5R"):
+            if token.startswith(prefix):
+                token = "DR" + token[len(prefix):]
+                break
+    if not token.startswith("DR"):
+        if token.startswith(("DB", "D8", "DS", "D5")):
+            token = "DR" + token[2:]
+        elif token.startswith("D") and len(token) >= 5 and token[1] not in "R":
+            token = "DR" + token[1:]
+
+    if token.startswith("DR"):
+        suffix = token[2:].translate(str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "B": "8", "S": "5", "Z": "2", "T": "7"}))
+        m = re.search(r"(\d{5,12})", suffix)
+        if m:
+            return "DR" + m.group(1)
+    return ""
+
+def normalize_product_name(description: str) -> str:
+    """Normalize Thermo/Fisher middle-column product names for Simplex invoices.
+
+    Examples:
+    SS20 DNA LADDER 100UL -> ss20 DNA Ladder (100uL)
+    SS50 DNA LADDER 1000L -> ss50 DNA Ladder (100uL)
+    """
+    raw = str(description or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper().replace("$", "S")
+    upper = upper.replace("SS5O", "SS50").replace("S5O", "SS50")
+    upper = upper.replace("S660", "SS50").replace("S650", "SS50").replace("S560", "SS50")
+    upper = upper.replace("SS 50", "SS50").replace("SS 20", "SS20")
+    upper = upper.replace("DHA", "DNA").replace("TADDER", "LADDER").replace("LADOER", "LADDER")
+    upper = upper.replace("1000L", "100UL").replace("1001L", "100UL").replace("1000IL", "100UL")
+    upper = upper.replace("100 U L", "100UL").replace("100 L", "100UL").replace("100ΜL", "100UL")
+    m = re.search(r"S{1,2}\s*(\d{2})\s*DNA\s+LADDER(?:\s*(\d+)\s*(?:U|µ)?L)?", upper, re.I)
+    if m:
+        size = m.group(1)
+        volume = m.group(2) or "100"
+        return f"ss{size} DNA Ladder ({volume}uL)"
+    m2 = re.search(r"(?:660|650|560)\s*DNA\s+LADDER(?:\s*(\d+)\s*(?:U|µ)?L)?", upper, re.I)
+    if m2:
+        volume = m2.group(1) or "100"
+        return f"ss50 DNA Ladder ({volume}uL)"
+    # Last-resort cleanup keeps user-entered text readable without inventing details.
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    cleaned = re.sub(r"\bDNA\s+LADDER\b", "DNA Ladder", cleaned, flags=re.I)
+    return cleaned
+
+def find_fisher_scientific_order_number(text: str, filename: str) -> str:
+    """Extract Customer PO from the Fisher Scientific Order Number field.
+
+    Important: do not use the PDF filename or the "Customer Purchase Order Number"
+    field for this invoice field. For Thermo Fisher/Fisher Scientific POs, the
+    correct value is the order number displayed next to/under the label "Fisher
+    Scientific Order Number" and it typically begins with DR.
+    """
+    normalized_text = normalize_ocr_text(text)
+
+    # Best case: a DR-prefixed token appears close after the exact label. Scan only
+    # the local field region so we do not accidentally capture unrelated order text.
+    label_match = re.search(r"Fisher\s+Scientific\s+Order\s+Number", normalized_text, re.I)
+    if label_match:
+        local = normalized_text[label_match.end(): label_match.end() + 550]
+        local = re.split(r"Order\s+Date|Quote\s+Number|Terms\s+and\s+Conditions", local, flags=re.I)[0]
+        # The correct Customer PO is the DR-prefixed Fisher Scientific Order Number
+        # immediately beside/below the label. Prefer local DR/DBR/D8R OCR variants.
+        for m in re.finditer(r"\b(?:D\s*[B8EP]?\s*R\s*|D\s*[B8S5]{1,2}\s+)[A-Z0-9]{2,12}(?:\s+[A-Z0-9]{2,8})?\b", local, re.I):
+            candidate = normalize_fisher_order_candidate(m.group(0))
+            if candidate and candidate.startswith("DR"):
+                return candidate
+        # Fallback for OCR that drops the visible R but keeps a D-starting order token.
+        # Only use this in the immediate Fisher Scientific Order Number region.
+        for m in re.finditer(r"\bD[A-Z0-9]{5,12}(?:\s+[A-Z0-9]{2,8})?\b", local, re.I):
+            candidate = normalize_fisher_order_candidate(m.group(0))
+            if candidate and candidate.startswith("DR"):
+                return candidate
+
+    # Line-aware fallback: value is often at the beginning of the next OCR line.
+    lines = [clean_ship_line(x) for x in normalized_text.splitlines() if clean_ship_line(x)]
+    for i, line in enumerate(lines):
+        if re.search(r"Fisher\s+Scientific\s+Order\s+Number", line, re.I):
+            window = " ".join(lines[i:i + 5])
+            for m in re.finditer(r"\b(?:D\s*[B8EP]?\s*R\s*|D\s*[B8S5]{1,2}\s+)[A-Z0-9]{2,10}(?:\s+[A-Z0-9]{2,8})?\b", window, re.I):
+                candidate = normalize_fisher_order_candidate(m.group(0))
+                if candidate:
+                    return candidate
+
+            # Last local fallback: take the first alphanumeric field token after the label,
+            # but only if it is not a label/customer-account word.
+            for nxt in lines[i + 1:i + 4]:
+                tokens = re.findall(r"\b[A-Z0-9][A-Z0-9-]{5,}\b", nxt.upper())
+                for token in tokens:
+                    token = clean_order_token(token)
+                    if token and not re.search(r"ORDER|DATE|QUOTE|NUMBER|CUSTOMER|ACCOUNT|TERMS|FISHER|SCIENTIFIC|THERMO|BRAND", token):
+                        candidate = normalize_fisher_order_candidate(token)
+                        if candidate:
+                            return candidate
+
+    # Final conservative fallback: among all OCR tokens, prefer DR-prefixed candidates.
+    # This prevents accidentally using the PDF filename or the separate Customer Purchase
+    # Order Number while still catching sideways/fragmented OCR such as "DBR2IB 340".
+    candidates: list[str] = []
+    for m in re.finditer(r"\b(?:D\s*[B8EP]?\s*R\s*|D\s*[B8S5]{1,2}\s+)[A-Z0-9]{2,10}(?:\s+[A-Z0-9]{2,8})?\b", normalized_text, re.I):
+        cand = normalize_fisher_order_candidate(m.group(0))
+        if cand and cand.startswith("DR"):
+            candidates.append(cand)
+    if candidates:
+        # Prefer the first occurrence because the Fisher Scientific Order Number appears
+        # near the top of the PO before other references.
+        return candidates[0]
+
+    # We intentionally do not fall back to the filename here. If the field cannot be
+    # read, leave it blank so the review screen makes the issue obvious.
+    return ""
+
+
+def extract_bill_to(text: str) -> str:
+    email = "APFax@thermofisher.com" if re.search(r"ap\s*fax|apfax|apifax", text, re.I) else "APFax@thermofisher.com"
+    m = re.search(r"P\.?O\.?\s*Box\s*1768.*?Pittsburgh,?\s*PA\s*15[28]30", text, re.I | re.S)
+    if m:
+        return f"Fisher Scientific\nP.O. Box 1768\nPittsburgh, PA 15230\nEmail: {email}"
+    return THERMO_BILL_TO_DEFAULT
+
+
+def clean_ship_line(line: str) -> str:
+    line = re.sub(r"^[|!\[\](){}/\\\-\s]+", "", line).strip()
+    line = re.sub(r"[|!\[\]{}]+$", "", line).strip()
+    line = re.sub(r"\s{2,}", " ", line)
+    return line
+
+
+def _looks_like_ship_company(line: str) -> bool:
+    return bool(re.search(r"\b(GRAIL|MAYO|CLINIC|SCIEX|UNIVERSITY|HOSPITAL|LAB|LABORATORY|INC|LLC|CORP|COMPANY)\b", line, re.I))
+
+
+def _format_ship_line(line: str) -> str:
+    ln = clean_ship_line(line)
+    ln = ln.replace("REF¥", "REF#").replace("REFY", "REF#").replace("REFF", "REF#")
+    ln = ln.replace("GRAIL THC", "GRAIL INC").replace("GRAIL THG", "GRAIL INC")
+    ln = ln.replace("HC $4", "NC 54").replace("HC 54", "NC 54").replace("NC $4", "NC 54")
+    ln = re.split(r"\s+i\s+PURCHASING\b|\s+PURCHASING\b|\s+i\s+SCOTT\b|\s+SCOTT\s+MORES\b|\s+Pittsburgh\b", ln, flags=re.I)[0]
+    ln = re.sub(r"\bS5901\b", "55901", ln)
+    ln = re.sub(r"\bVEST\b", "WEST", ln, flags=re.I)
+    ln = re.sub(r"\bASSEMBLY\b.*$", "ASSEMBLY", ln, flags=re.I)
+    ln = re.sub(r"\s+L$", "", ln)
+    ln = re.sub(r"\bROCHESTER\s+MN\.?\s*(\d{5})", r"Rochester, MN \1", ln, flags=re.I)
+    ln = re.sub(r"\bDURHAM\s+NC\.?\s*(\d{5})", r"Durham, NC \1", ln, flags=re.I)
+    ln = re.sub(r"\bMARLBOROUGH,?\s+MASSACHUSETTS\b", "Marlborough, Massachusetts", ln, flags=re.I)
+    ln = re.sub(r"^REF\s*[#:]?\s*[:#-]*\s*", "Ref: ", ln, flags=re.I)
+    ln = re.sub(r"^Ref:\s*[:#-]+\s*", "Ref: ", ln, flags=re.I)
+    ln = re.sub(r"^ATTN\s*[:\-]?\s*", "ATTN: ", ln, flags=re.I)
+    ln = re.sub(r"\s+", " ", ln).strip(" |-()")
+    return ln
+
+
+def extract_ship_to(text: str) -> str:
+    """Extract the Thermo Fisher Ship To block from OCR text.
+
+    The PDFs are scanned/sideways and OCR commonly merges three columns:
+    supplier information | ship-to information | accounts payable. This parser
+    favors the center ship-to column and avoids hard-coding a single customer.
+    """
+    raw_lines = [x for x in text.splitlines() if x.strip()]
+    cleaned: list[str] = []
+
+    for raw in raw_lines:
+        ln = clean_ship_line(raw)
+        low = ln.lower()
+
+        # Stop at order notes/product table; ship-to block is above this section.
+        if re.search(r"order notes|product description|catalog|total:|page:", ln, re.I):
+            break
+        # Skip obvious non-ship-to rows.
+        if re.search(r"purchase order|fisher scientific order|order date|terms and conditions|supplier number|customer purchase|msds|caller:|due date", ln, re.I):
+            continue
+
+        # Lines with pipes are easiest: the center segment is usually ship-to.
+        if "|" in ln:
+            parts = [clean_ship_line(p) for p in ln.split("|")]
+            # Remove empty and obvious AP/supplier fragments.
+            candidates = []
+            for part in parts:
+                if not part:
+                    continue
+                # If OCR merged supplier + ship-to company in the same segment, keep only the customer part.
+                if re.search(r"SIMPLEX", part, re.I) and _looks_like_ship_company(part):
+                    part = re.sub(r"^.*?SIMPLEX\s+SCIENCES\s*['iI,;:-]*\s*", "", part, flags=re.I)
+                if re.search(r"EDWARDS|NEW HAVEN|Fisher Scientific\s*$|Pittsburgh|APVendor|APFax|Telephone|SCOTT MORES|PURCHASING|Address:\s*Fisher|Email:", part, re.I):
+                    # Some useful ship-to fragments have right-column AP/purchasing text attached.
+                    trimmed = re.split(r"\s+Pittsburgh\b|\s+i\s+PURCHASING|\s+PURCHASING", part, flags=re.I)[0]
+                    if trimmed != part and re.search(r"DURHAM|ROCHESTER|MARLBOROUGH|\b\d{3,5}\b.*\b(HWY|HIGHWAY|ROAD|RD|STREET|ST|AVE|WAY|DRIVE|DR|WEST|EAST|NORTH|SOUTH|ASSEMBLY)\b", trimmed, re.I):
+                        candidates.append(trimmed)
+                    continue
+                candidates.append(part)
+            # Prefer reference/attention/address/company-looking middle content.
+            for part in candidates:
+                if re.search(r"REF[#¥YF]?|ATTN|\b\d{3,5}\b.*\b(HWY|ROAD|RD|ST|STREET|AVE|WAY|DR|DRIVE|WEST|EAST|NORTH|SOUTH|ASSEMBLY)\b|\b(GRAIL|MAYO|CLINIC|SCIEX|INC|LLC)\b|\b(DURHAM|ROCHESTER|MARLBOROUGH)\b", part, re.I):
+                    cleaned.append(_format_ship_line(part))
+                    break
+            continue
+
+        # Company line without clean pipes: remove known left/right columns.
+        if _looks_like_ship_company(ln) and not re.search(r"SIMPLEX|Fisher Scientific Company", ln, re.I):
+            part = re.sub(r".*?(GRAIL\s+INC|MAYO\s+CLINIC[^|]*|AB\s+SCIEX\s+LLC).*", r"\1", ln, flags=re.I)
+            cleaned.append(_format_ship_line(part))
+            continue
+
+        # REF line may appear after supplier street.
+        if re.search(r"REF[#¥YF]", ln, re.I):
+            part = re.sub(r".*?(REF[#¥YF]?\s*[:#-]?\s*[A-Z0-9-]+)", r"\1", ln, flags=re.I)
+            part = re.split(r"\s+P\.?O\.?\s*Box|\s+Pittsburgh|\|", part, flags=re.I)[0]
+            cleaned.append(_format_ship_line(part))
+            continue
+
+        # Street lines in the ship-to column, including Mayo's OCR "(4165 HWY 14 VEST L".
+        if re.search(r"\b\d{3,5}\b.*\b(HWY|HIGHWAY|ROAD|RD|STREET|ST|AVE|WAY|DRIVE|DR|WEST|EAST|NORTH|SOUTH|ASSEMBLY)\b", ln, re.I):
+            part = ln
+            # Drop supplier-side material and AP-side material.
+            part = re.sub(r"^.*?((?:\d{3,5})\s+[^|]*(?:HWY|HIGHWAY|ROAD|RD|STREET|ST|AVE|WAY|DRIVE|DR|WEST|EAST|NORTH|SOUTH|ASSEMBLY)[^|]*)", r"\1", part, flags=re.I)
+            part = re.split(r"\s+Pittsburgh\b|\s+PURCHASING\b|\|", part, flags=re.I)[0]
+            cleaned.append(_format_ship_line(part))
+            continue
+
+        if re.search(r"\b(DURHAM|ROCHESTER|MARLBOROUGH)\b", ln, re.I):
+            part = re.sub(r".*?\b(DURHAM\s+NC\.?\s*\d{5}|ROCHESTER\s+MN\.?\s*\S{5}|MARLBOROUGH,?\s+MASSACHUSETTS).*", r"\1", ln, flags=re.I)
+            cleaned.append(_format_ship_line(part))
+            continue
+
+        if re.search(r"\bATTN\b", ln, re.I):
+            part = re.sub(r".*?(ATTN\s*[:\-]?\s*[^|]+).*", r"\1", ln, flags=re.I)
+            cleaned.append(_format_ship_line(part))
+            continue
+
+    # Generic fallback: if OCR produced a clear Ship To section, walk the following rows.
+    if len(cleaned) < 3:
+        lines = [clean_ship_line(x) for x in text.splitlines()]
+        start = None
+        for i, ln in enumerate(lines):
+            if re.search(r"Ship\s*To\s*Information|Shi\s*To\s*Information", ln, re.I):
+                start = i + 1
+                break
+        if start is not None:
+            for ln in lines[start:start + 12]:
+                if re.search(r"send\s*invoice|accounts payable|purchasing agent|customer purchase|supplier number|order notes|telephone|email:", ln, re.I):
+                    break
+                mid = ln
+                if "|" in mid:
+                    pieces = [clean_ship_line(p) for p in mid.split("|") if clean_ship_line(p)]
+                    if len(pieces) >= 2:
+                        mid = pieces[1]
+                mid = re.sub(r"\bEmail:.*$|\bAddress:.*$", "", mid, flags=re.I).strip()
+                if mid and not re.search(r"SIMPLEX|EDWARDS|NEW HAVEN|APVendor|APFax|Fisher Scientific\s*$", mid, re.I):
+                    cleaned.append(_format_ship_line(mid))
+
+    final: list[str] = []
+    for ln in cleaned:
+        ln = _format_ship_line(ln)
+        if not ln:
+            continue
+        if re.search(r"SIMPLEX|EDWARDS|NEW HAVEN|Pittsburgh|APVendor|APFax|SCOTT MORES|PURCHASING|Telephone|Supplier information|Ship To Information", ln, re.I):
+            continue
+        if ln.lower() not in {x.lower() for x in final}:
+            final.append(ln)
+
+    # Add country only if absent and we have a real address block.
+    if final and not any(re.search(r"United States", x, re.I) for x in final):
+        final.append("United States of America")
+    return "\n".join(final)
+
+def parse_line_items(text: str) -> list[dict[str, str]]:
+    lines = [clean_ship_line(x) for x in text.splitlines() if clean_ship_line(x)]
+    items: list[dict[str, str]] = []
+
+    for line in lines:
+        low = line.lower()
+        if not ("ladder" in low or "dna" in low or "ss50" in low or "ss20" in low or "s660" in low):
+            continue
+
+        # Quantity is usually immediately before UOM.
+        qty = ""
+        m_qty = re.search(r"\|?\s*(\d+)\s*\|?\s*(?:EA|EACH|PK|CS)\b", line, re.I)
+        if m_qty:
+            qty = m_qty.group(1)
+
+        # Extended cost is usually the final readable money value on the row.
+        money_values = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
+        extended_cost = money_values[-1] if money_values else ""
+        unit_cost = ""
+        if len(money_values) >= 2:
+            unit_cost = money_values[-2]
+        elif extended_cost and qty:
+            unit_cost = f"{money_to_float(extended_cost) / max(float(qty), 1):.2f}"
+
+        desc_match = re.search(r"((?:SS\s*\d+|S660|S650|SS5O|SSS0)\s*DNA\s+LADDER\s+[^|\n]*)", line, re.I)
+        desc = desc_match.group(1) if desc_match else line
+        # Remove quantity/UOM/prices/dates trailing after the description.
+        desc = re.split(r"\s+\d+\s*(?:EA|EACH|PK|CS)\b", desc, flags=re.I)[0]
+        desc = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}.*$", "", desc).strip()
+        desc = re.sub(r"\s+", " ", desc).strip(" |-")
+        desc = desc.upper()
+        # OCR corrections for the provided Thermo Fisher format.
+        desc = desc.replace("SS5O", "SS50").replace("SS 50", "SS50").replace("SS 20", "SS20")
+        desc = desc.replace("S660 DNA LADDER", "SS50 DNA LADDER").replace("S650 DNA LADDER", "SS50 DNA LADDER")
+        desc = desc.replace("1000L", "100UL").replace("1001L", "100UL").replace("100 U L", "100UL")
+        desc = desc.replace("100 L", "100UL")
+
+        if desc and (extended_cost or unit_cost or qty):
+            items.append({
+                "quantity": qty,
+                "item": normalize_product_name(desc),
+                "unit_price": clean_money(unit_cost) if unit_cost else "",
+                "amount": clean_money(extended_cost) if extended_cost else "",
+            })
+
+    if items:
+        return items
+
+    # Fallback: infer from any row with one or more money values and a quantity/UOM.
+    for line in lines:
+        nums = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
+        if nums and re.search(r"\b\d+\s*(EA|EACH|PK|CS)\b", line, re.I):
+            qty_match = re.search(r"\b(\d+)\s*(EA|EACH|PK|CS)\b", line, re.I)
+            qty = qty_match.group(1) if qty_match else ""
+            amount = nums[-1]
+            unit = nums[-2] if len(nums) >= 2 else (f"{money_to_float(amount) / max(float(qty or 1), 1):.2f}" if qty else "")
+            desc = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}.*$", "", line).strip(" |-")
+            desc = re.sub(r"^.*?\b([A-Z]{1,4}\d{2,}.*)$", r"\1", desc).strip()
+            items.append({"quantity": qty, "item": normalize_product_name(desc), "unit_price": clean_money(unit), "amount": clean_money(amount)})
+            break
+
+    return items or [{"quantity": "", "item": "", "unit_price": "", "amount": ""}]
+
+
+@st.cache_resource(show_spinner=False)
+def _easyocr_reader():
+    """Lazy, cached EasyOCR reader. Returns None if easyocr cannot load."""
+    try:
+        import easyocr  # type: ignore
+        return easyocr.Reader(["en"], gpu=False, verbose=False)
+    except Exception:
+        return None
+
+
+def _find_label_box(img) -> tuple[int, int, int, int] | None:
+    """Locate the 'Fisher Scientific Order Number' label in a rendered page image.
+
+    Returns (x0, y0, x1, y1) of the label bounding box, or None if not found.
+    Uses tesseract image_to_data on the whole page; OCR may misread the inner words
+    ("Scientific" → "Scientia:", "Order" → "Orcier") so we anchor on the first letter
+    of each expected token plus row alignment rather than exact string equality.
+    """
+    if pytesseract is None or Image is None:
+        return None
+    try:
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config="--psm 6")
+    except Exception:
+        return None
+    tokens = data.get("text") or []
+    n = len(tokens)
+    expected = ["f", "s", "o", "n"]  # Fisher Scientific Order Number — first letters
+    best: tuple[int, int, int, int] | None = None
+    for i in range(n):
+        t = (tokens[i] or "").strip()
+        if not t or not t.lower().startswith("fisher"):
+            continue
+        # Collect the next non-empty tokens that share approximately the same row.
+        row_y = data["top"][i]
+        row_h = max(1, data["height"][i])
+        window = [(i, t)]
+        j = i + 1
+        while j < n and len(window) < 8:
+            tj = (tokens[j] or "").strip()
+            if tj:
+                # Same visual row tolerance: within one label height.
+                if abs(data["top"][j] - row_y) <= row_h * 0.8:
+                    window.append((j, tj))
+                else:
+                    break
+            j += 1
+        if len(window) < 4:
+            continue
+        first_letters = [w[1][0].lower() for w in window[:4]]
+        if first_letters == expected:
+            idxs = [w[0] for w in window[:4]]
+            xs = [data["left"][k] for k in idxs]
+            ys = [data["top"][k] for k in idxs]
+            ws = [data["width"][k] for k in idxs]
+            hs = [data["height"][k] for k in idxs]
+            x0 = min(xs)
+            y0 = min(ys)
+            x1 = max(x + w for x, w in zip(xs, ws))
+            y1 = max(y + h for y, h in zip(ys, hs))
+            # Prefer the topmost match (the label sits high on the page).
+            if best is None or y0 < best[1]:
+                best = (x0, y0, x1, y1)
+    return best
+
+
+def extract_dr_with_easyocr(file_bytes: bytes) -> str:
+    """Targeted DR-order-number OCR using EasyOCR on the cropped label region.
+
+    Falls back gracefully (returns "") if EasyOCR or PIL are unavailable.
+    """
+    if Image is None or ImageOps is None:
+        return ""
+    reader = _easyocr_reader()
+    if reader is None:
+        return ""
+
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return ""
+
+    best_candidate = ""
+    best_score = -1.0
+
+    with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+        if len(pdf) == 0:
+            return ""
+        page = pdf[0]
+        pix = page.get_pixmap(dpi=500)
+        base = Image.open(io.BytesIO(pix.tobytes("png")))
+
+    for angle in (0, 90, 180, 270):
+        img = base.rotate(angle, expand=True) if angle else base
+        box = _find_label_box(img)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        label_h = max(1, y1 - y0)
+        label_w = max(1, x1 - x0)
+        # Wider crop so the DR prefix is not clipped on the left edge. EasyOCR
+        # is more accurate on the original color image than on aggressively
+        # preprocessed grayscale (preprocessing destroys subtle stroke contrast).
+        crop_x0 = max(0, int(x0 - label_w * 0.10))
+        crop_x1 = min(img.size[0], int(x0 + label_w * 2.0))
+        crop_y0 = min(img.size[1], int(y1 + label_h * 0.2))
+        crop_y1 = min(img.size[1], int(y1 + label_h * 5.0))
+        if crop_y1 <= crop_y0 or crop_x1 <= crop_x0:
+            continue
+        crop = img.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+        arr = np.array(crop)
+        try:
+            results = reader.readtext(
+                arr,
+                detail=1,
+                paragraph=False,
+                allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+            )
+        except Exception:
+            results = []
+        for entry in results:
+            if not entry or len(entry) < 3:
+                continue
+            _, text, conf = entry[0], entry[1], float(entry[2])
+            if conf < 0.45:
+                continue
+            candidate = normalize_fisher_order_candidate(str(text or ""))
+            if not candidate or not candidate.startswith("DR"):
+                continue
+            suffix_digits = sum(1 for ch in candidate[2:] if ch.isdigit())
+            if suffix_digits < 5:
+                continue
+            score = conf * 10 + suffix_digits
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        if best_candidate:
+            break
+
+    return best_candidate
+
+
+def parse_thermofisher_po(text: str, filename: str, file_bytes: bytes | None = None, rotation: str = "") -> ParsedPO:
+    text = normalize_ocr_text(text)
+    purchase_order_number = find_purchase_order_number(text, filename)
+    # Auto-extraction of the DR-prefixed Fisher Scientific Order Number is unreliable
+    # on scanned POs and has historically produced hallucinated values. The field is
+    # pre-filled with "DR" so the operator only has to type the digits that follow.
+    fisher_order_number = "DR"
+    ship_to = extract_ship_to(text)
+    bill_to = extract_bill_to(text)
+    items = parse_line_items(text)
+    subtotal = sum(money_to_float(row.get("amount")) for row in items)
+    return ParsedPO(
+        invoice_issued_to="Fisher Scientific",
+        order_number=purchase_order_number,
+        customer_po_number=fisher_order_number,
+        tracking_number="",
+        bill_to=bill_to,
+        ship_to=ship_to,
+        total=clean_money(subtotal) if subtotal else "",
+        currency="USD",
+        source_file=filename,
+        line_items=items,
+        raw_text=text,
+    )
+
+
+def docx_contains_jinja(template_bytes: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(template_bytes)) as zf:
+            xml = "\n".join(zf.read(name).decode("utf-8", errors="ignore") for name in zf.namelist() if name.startswith("word/") and name.endswith(".xml"))
+        return ("{{" in xml) or ("{%" in xml)
+    except Exception:
+        return False
+
+
+def _set_rfonts(run, font_name: str = "Avenir") -> None:
+    run.font.name = font_name
+    run.font.size = Pt(12)
+    try:
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.rFonts
+        if rFonts is None:
+            from docx.oxml import OxmlElement
+            rFonts = OxmlElement("w:rFonts")
+            rPr.append(rFonts)
+        for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
+            rFonts.set(f"{{http://schemas.openxmlformats.org/wordprocessingml/2006/main}}{attr}", font_name)
+    except Exception:
+        pass
+
+
+def _set_paragraph_text(paragraph, text: str, bold: bool | None = None) -> None:
+    # Preserve the paragraph and cell/table formatting, but replace the actual text.
+    while len(paragraph.runs) > 1:
+        paragraph._p.remove(paragraph.runs[-1]._r)
+    if paragraph.runs:
+        paragraph.runs[0].text = str(text or "")
+        _set_rfonts(paragraph.runs[0])
+        if bold is not None:
+            paragraph.runs[0].bold = bold
+    else:
+        run = paragraph.add_run(str(text or ""))
+        _set_rfonts(run)
+        if bold is not None:
+            run.bold = bold
+
+
+def _set_cell_text(cell, text: str, bold: bool | None = None) -> None:
+    paragraphs = cell.paragraphs
+    if not paragraphs:
+        cell.add_paragraph()
+        paragraphs = cell.paragraphs
+    _set_paragraph_text(paragraphs[0], str(text or ""), bold=bold)
+    try:
+        paragraphs[0].paragraph_format.space_after = Pt(0)
+        paragraphs[0].paragraph_format.space_before = Pt(0)
+    except Exception:
+        pass
+    # Remove surplus paragraphs, which otherwise show as blank lines in Word.
+    for p in list(cell.paragraphs)[1:]:
+        _remove_paragraph(p)
+
+
+
+
+def _set_cell_label_body(cell, label: str, body: str, label_bold: bool = True, body_bold: bool = False) -> None:
+    """Write a label plus multiline body into one cell, preserving table geometry.
+
+    Used for Bill to / Ship to so the section label can remain emphasized while
+    the address block itself is normal weight, matching the Simplex invoice template.
+    """
+    paragraphs = cell.paragraphs
+    if not paragraphs:
+        cell.add_paragraph()
+        paragraphs = cell.paragraphs
+    p = paragraphs[0]
+    for run in list(p.runs):
+        p._p.remove(run._r)
+    label_run = p.add_run(str(label or ""))
+    _set_rfonts(label_run)
+    label_run.bold = label_bold
+    body_run = p.add_run("\n" + str(body or ""))
+    _set_rfonts(body_run)
+    body_run.bold = body_bold
+    for extra in paragraphs[1:]:
+        _set_paragraph_text(extra, "", bold=body_bold)
+
+def _ensure_cell_paragraphs(cell, count: int):
+    while len(cell.paragraphs) < count:
+        cell.add_paragraph()
+    return cell.paragraphs
+
+
+def _write_para(paragraph, text: str, *, bold: bool | None = None, size_pt: int | float = 12, keep_indent: bool = True) -> None:
+    # Replace paragraph text while preserving paragraph-level formatting such as
+    # indentation, spacing, and alignment from the uploaded template.
+    while len(paragraph.runs) > 1:
+        paragraph._p.remove(paragraph.runs[-1]._r)
+    if paragraph.runs:
+        run = paragraph.runs[0]
+        run.text = str(text or "")
+    else:
+        run = paragraph.add_run(str(text or ""))
+    _set_rfonts(run)
+    run.font.size = Pt(size_pt)
+    if bold is not None:
+        run.bold = bold
+
+
+def _write_label_value_para(paragraph, label: str, value: str, *, label_bold: bool = False, value_bold: bool = False, size_pt: int | float = 12) -> None:
+    # Two-run paragraph so labels and dynamic values can carry independent bolding.
+    for run in list(paragraph.runs):
+        paragraph._p.remove(run._r)
+    r1 = paragraph.add_run(label)
+    _set_rfonts(r1); r1.font.size = Pt(size_pt); r1.bold = label_bold
+    r2 = paragraph.add_run(str(value or ""))
+    _set_rfonts(r2); r2.font.size = Pt(size_pt); r2.bold = value_bold
+
+
+def _remove_paragraph(paragraph) -> None:
+    try:
+        p = paragraph._element
+        p.getparent().remove(p)
+        paragraph._p = paragraph._element = None
+    except Exception:
+        pass
+
+
+def _tidy_para_spacing(paragraph) -> None:
+    try:
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.line_spacing = 1
+    except Exception:
+        pass
+
+
+def _set_left_indent(paragraph, inches: float) -> None:
+    try:
+        paragraph.paragraph_format.left_indent = Inches(inches)
+        paragraph.paragraph_format.first_line_indent = Inches(0)
+    except Exception:
+        pass
+
+
+def _write_multiline_body(cell, label: str, body: str) -> None:
+    lines = [x.rstrip() for x in str(body or "").splitlines() if x.rstrip()]
+    paragraphs = _ensure_cell_paragraphs(cell, max(1 + len(lines), 1))
+    _write_para(paragraphs[0], label, bold=True, size_pt=12)
+    _tidy_para_spacing(paragraphs[0])
+    for i, line in enumerate(lines, start=1):
+        _write_para(paragraphs[i], line, bold=False, size_pt=12)
+        _tidy_para_spacing(paragraphs[i])
+    # Remove surplus paragraphs instead of leaving blank paragraphs that create
+    # extra vertical whitespace below Bill to / Ship to blocks.
+    for p in list(cell.paragraphs)[1 + len(lines):]:
+        _remove_paragraph(p)
+
+def _force_avenir_12(doc: Document) -> None:
+    """Normalize font family to Avenir while respecting intentional template sizes.
+
+    Most invoice text remains 12 pt. The heading "Invoice" in the template is
+    intentionally 20 pt, so this function does not overwrite an existing run size.
+    """
+    for p in doc.paragraphs:
+        for r in p.runs:
+            current_size = r.font.size
+            _set_rfonts(r)
+            if current_size is not None:
+                r.font.size = current_size
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        current_size = r.font.size
+                        _set_rfonts(r)
+                        if current_size is not None:
+                            r.font.size = current_size
+
+
+def generate_from_filled_template(template_bytes: bytes, context: dict[str, Any]) -> bytes:
+    """Overwrite an already-filled Simplex invoice template while preserving layout.
+
+    This fixes the case where a completed prior invoice is uploaded as the template.
+    A completed invoice has no {{ placeholders }}, so docxtpl cannot change it. This
+    function edits the known Simplex invoice cells directly instead.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as f:
+        f.write(template_bytes)
+        temp_path = Path(f.name)
+    doc = Document(str(temp_path))
+
+    # Normalize product names from OCR/user edits before writing to the invoice.
+    rows = list(context.get("line_items") or [])
+    for row in rows:
+        if str(row.get("item", "")).strip().lower() != "fedex 2day shipping":
+            row["item"] = normalize_product_name(row.get("item", ""))
+
+    # Main Simplex template from the user's sample: table 0 has company/invoice/PO/bill-to/ship-to.
+    # Write into the existing paragraphs instead of collapsing each cell into one multiline paragraph.
+    # This preserves the uploaded template's spacing, indentation, bolding pattern, and row geometry.
+    if len(doc.tables) >= 1:
+        t = doc.tables[0]
+        try:
+            # Preserve the template's paragraph geometry exactly. In prior filled
+            # invoice templates the first cell may contain a blank paragraph above
+            # the company name; however, rewriting an explicit blank here created
+            # excessive vertical white space in some uploaded templates. We therefore
+            # write the company block from the first paragraph and clear only true
+            # leftovers at the end. Paragraph indentation/spacing comes from the
+            # uploaded template, so address lines keep their slight indent.
+            left = _ensure_cell_paragraphs(t.cell(0, 0), 7)
+            _write_para(left[0], context.get('company_name',''), bold=True, size_pt=12)
+            addr_lines = str(context.get('company_address','')).splitlines()
+            while len(addr_lines) < 4:
+                addr_lines.append("")
+            _write_para(left[1], addr_lines[0], bold=False, size_pt=12)
+            _write_para(left[2], addr_lines[1], bold=False, size_pt=12)
+            _write_para(left[3], addr_lines[2], bold=False, size_pt=12)
+            _write_para(left[4], addr_lines[3], bold=False, size_pt=12)
+            _write_para(left[5], f"e: {context.get('company_email','')}", bold=False, size_pt=12)
+            _write_para(left[6], f"t: {context.get('company_phone','')}", bold=False, size_pt=12)
+            # Force all sender address/contact lines to the same slight indent.
+            # Some uploaded completed templates have the first address paragraph
+            # accidentally reset to the left margin; the expected Simplex format
+            # indents every address/contact line under the bold company name.
+            for p in left[1:7]:
+                _set_left_indent(p, 0.18)
+                _tidy_para_spacing(p)
+            _tidy_para_spacing(left[0])
+            for p in left[7:]:
+                _write_para(p, "", bold=False, size_pt=12)
+
+            right = _ensure_cell_paragraphs(t.cell(0, 1), 6)
+            _write_para(right[0], "Invoice", bold=False, size_pt=20)
+            _write_label_value_para(right[1], "Invoice issued to: ", context.get('invoice_issued_to',''), label_bold=False, value_bold=False, size_pt=12)
+            _write_label_value_para(right[2], "Issue date: ", context.get('issue_date',''), label_bold=False, value_bold=False, size_pt=12)
+            _write_label_value_para(right[3], "Order number: ", context.get('order_number',''), label_bold=False, value_bold=False, size_pt=12)
+            _write_label_value_para(right[4], "Shipping date: ", context.get('shipping_date',''), label_bold=False, value_bold=False, size_pt=12)
+            _write_label_value_para(right[5], "Sales rep: ", context.get('sales_rep',''), label_bold=False, value_bold=False, size_pt=12)
+            for p in right[6:]:
+                _write_para(p, "", bold=False, size_pt=12)
+
+            _write_label_value_para(t.cell(1, 0).paragraphs[0], "Customer PO Number: ", context.get('customer_po_number',''), label_bold=True, value_bold=True, size_pt=12)
+            try:
+                _write_label_value_para(t.cell(1, 1).paragraphs[0], "FedEx Tracking Number: ", context.get('tracking_number',''), label_bold=True, value_bold=True, size_pt=12)
+            except Exception:
+                pass
+            _write_multiline_body(t.cell(2, 0), "Bill to:", context.get('bill_to',''))
+            _write_multiline_body(t.cell(2, 1), "Ship to:", context.get('ship_to',''))
+        except Exception:
+            pass
+
+    if len(doc.tables) >= 2:
+        t = doc.tables[1]
+        # Product lines are stored in the first body row for the user's sample template.
+        product_rows = [r for r in rows if str(r.get("item", "")).strip().lower() != "fedex 2day shipping"]
+        shipping_rows = [r for r in rows if str(r.get("item", "")).strip().lower() == "fedex 2day shipping"]
+        product = product_rows[0] if product_rows else {"quantity":"", "item":"", "unit_price":"", "amount":""}
+        shipping = shipping_rows[0] if shipping_rows else None
+        # Do not prepend a line break before the first product item. The uploaded
+        # template already supplies the row height/vertical position; adding a
+        # leading newline creates visible blank space before the first line item.
+        item_text = f"{product.get('item','')}"
+        amount_text = f"{product.get('amount','')}"
+        unit_text = f"{product.get('unit_price','')}"
+        if shipping and money_to_float(shipping.get("amount")) > 0:
+            # Keep no leading blank line before the first product, but preserve one
+            # visual spacer line between the product row and the FedEx shipping line.
+            # This matches the Simplex template while avoiding extra space below FedEx.
+            item_text += f"\n\nFedEx 2Day Shipping"
+            amount_text += f"\n\n{shipping.get('amount','')}"
+        try:
+            _set_cell_text(t.cell(1, 0), f"{product.get('quantity','')}")
+            _set_cell_text(t.cell(1, 1), item_text)
+            _set_cell_text(t.cell(1, 2), unit_text)
+            _set_cell_text(t.cell(1, 3), amount_text)
+            # Last row is total row in both the prior invoice template and the generated template.
+            last = len(t.rows) - 1
+            _set_cell_text(t.cell(last, 2), "  Total:")
+            _set_cell_text(t.cell(last, 3), f"{context.get('total','')} {context.get('currency','USD')}")
+        except Exception:
+            pass
+
+    # Payment lines if they are normal paragraphs in the uploaded filled invoice.
+    payment_lines = [
+        "Make payments to:",
+        f"Bank Name: {context.get('bank_name','')}",
+        f"Account Number: {context.get('account_number','')}",
+        f"Routing Number (For Direct Deposit): {context.get('direct_deposit_routing','')}",
+        f"Routing Number (For Wire Transfer): {context.get('wire_routing','')}",
+        f"Swift Code: {context.get('swift_code','')}",
+    ]
+    pi = 0
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if pi < len(payment_lines) and (txt.startswith("Make payments") or txt.startswith("Bank Name:") or txt.startswith("Account Number:") or txt.startswith("Routing Number") or txt.startswith("Swift Code:")):
+            _set_paragraph_text(p, payment_lines[pi])
+            pi += 1
+
+    _force_avenir_12(doc)
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
+
+
+def generate_docx(template_bytes: bytes, context: dict[str, Any]) -> bytes:
+    # Placeholder templates use docxtpl. Completed prior invoice templates are edited in-place.
+    if not docx_contains_jinja(template_bytes):
+        return generate_from_filled_template(template_bytes, context)
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as f:
+        f.write(template_bytes)
+        temp_path = Path(f.name)
+    tpl = DocxTemplate(str(temp_path))
+    tpl.render(context)
+    output = io.BytesIO()
+    tpl.save(output)
+    # Enforce Avenir 12 after template rendering.
+    doc = Document(io.BytesIO(output.getvalue()))
+    _force_avenir_12(doc)
+    final = io.BytesIO()
+    doc.save(final)
+    return final.getvalue()
+
+def build_context(sender: dict[str, str], invoice: dict[str, Any], shipping_cost: str) -> dict[str, Any]:
+    rows = list(invoice.get("line_items") or [])
+    for row in rows:
+        if str(row.get("item", "")).strip().lower() != "fedex 2day shipping":
+            row["item"] = normalize_product_name(row.get("item", ""))
+    ship_cost_float = money_to_float(shipping_cost)
+    if ship_cost_float > 0:
+        rows.append({"quantity": "", "item": "FedEx 2Day Shipping", "unit_price": "", "amount": clean_money(ship_cost_float)})
+    subtotal = sum(money_to_float(r.get("amount")) for r in rows)
+    invoice = {**invoice, "line_items": rows, "total": clean_money(subtotal)}
+    return {**sender, **invoice}
+
+
+
+def apply_brand_style() -> None:
+    """Apply Simplex Sciences internal software styling.
+
+    The visual language is deliberately closer to enterprise internal tooling than
+    a consumer prototype: restrained typography, dense information architecture,
+    clear review states, and a limited navy/white/slate palette.
+    """
+    st.markdown(
+        """
+        <style>
+            :root {
+                --simplex-navy: #11165C;
+                --simplex-navy-2: #181E72;
+                --simplex-slate: #334155;
+                --simplex-muted: #64748B;
+                --simplex-border: #D8DEE9;
+                --simplex-surface: #F8FAFC;
+                --simplex-soft: #EEF2FF;
+                --simplex-accent: #2F80ED;
+            }
+            .stApp { background: linear-gradient(180deg, #F8FAFC 0%, #FFFFFF 42%); }
+            [data-testid="stSidebar"] { background: #FFFFFF; border-right: 1px solid var(--simplex-border); }
+            [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: var(--simplex-navy); letter-spacing: -0.01em; }
+            .simplex-hero {
+                border: 1px solid var(--simplex-border);
+                border-radius: 18px;
+                padding: 1.25rem 1.35rem;
+                margin-bottom: 1.1rem;
+                background: linear-gradient(135deg, #11165C 0%, #151C68 56%, #273391 100%);
+                color: white;
+                box-shadow: 0 14px 36px rgba(17, 22, 92, 0.14);
+            }
+            .simplex-eyebrow { font-size: 0.74rem; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.78; margin-bottom: 0.25rem; }
+            .simplex-title { font-size: 1.88rem; line-height: 1.08; font-weight: 760; letter-spacing: -0.035em; margin: 0; }
+            .simplex-subtitle { font-size: 0.98rem; opacity: 0.88; margin-top: 0.55rem; max-width: 68rem; }
+            .simplex-meta {
+                display: flex; gap: .55rem; flex-wrap: wrap; margin-top: 1rem;
+            }
+            .simplex-pill {
+                border: 1px solid rgba(255,255,255,.24);
+                background: rgba(255,255,255,.09);
+                color: white;
+                padding: .32rem .55rem;
+                border-radius: 999px;
+                font-size: .76rem;
+            }
+            div[data-testid="stAlert"] { border-radius: 14px; border-color: var(--simplex-border); }
+            div[data-testid="stExpander"] { border: 1px solid var(--simplex-border); border-radius: 14px; background: white; }
+            .stTextInput input, .stTextArea textarea, .stDateInput input {
+                border-radius: 10px !important;
+                border-color: #CBD5E1 !important;
+            }
+            .stButton button, .stDownloadButton button {
+                border-radius: 10px !important;
+                border: 1px solid var(--simplex-navy) !important;
+                background: var(--simplex-navy) !important;
+                color: #FFFFFF !important;
+                font-weight: 650 !important;
+            }
+            .stButton button:hover, .stDownloadButton button:hover {
+                background: var(--simplex-navy-2) !important;
+                border-color: var(--simplex-navy-2) !important;
+            }
+            h1, h2, h3 { color: var(--simplex-navy); letter-spacing: -0.02em; }
+            hr { border-color: var(--simplex-border); }
+            .simplex-footer {
+                margin-top: 2rem;
+                padding-top: .9rem;
+                border-top: 1px solid var(--simplex-border);
+                color: var(--simplex-muted);
+                font-size: .78rem;
+            }
+            [data-testid="stFileUploaderDropzoneInstructions"] small,
+            [data-testid="stFileUploader"] small,
+            [data-testid="stFileUploaderDropzone"] small,
+            [data-testid="stFileUploaderDropzoneInstructions"] > div > span,
+            section[data-testid="stFileUploadDropzone"] small,
+            .stFileUploader section small,
+            .uploadedFileName + div,
+            .stFileUploader [data-testid="stFileDropzoneInstructions"] small {
+                display: none !important;
+            }
+            [data-testid="stFileUploaderDropzoneInstructions"] > div {
+                font-size: 0.95rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_product_header() -> None:
+    st.markdown("# Thermofisher Invoice Processing")
+    st.caption("Developed for internal use by Simplex Operations, William Shiu (2026)")
+
+
+def require_passcode() -> None:
+    """Block the rest of the UI until the correct passcode is entered."""
+    if st.session_state.get("simplex_passcode_ok"):
+        return
+    st.markdown("### Restricted access")
+    st.caption("Enter the operations passcode to continue.")
+    with st.form("simplex-passcode-form", clear_on_submit=False):
+        entered = st.text_input("Passcode", type="password", key="simplex_passcode_input")
+        submitted = st.form_submit_button("Unlock")
+    if submitted:
+        if entered == APP_PASSCODE:
+            st.session_state["simplex_passcode_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect passcode.")
+    st.stop()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Thermofisher Invoice Processing", layout="wide")
+    apply_brand_style()
+    render_product_header()
+    require_passcode()
+
+    with st.sidebar:
+        if BRAND_LOGO.exists():
+            st.image(str(BRAND_LOGO), use_container_width=True)
+        uploaded_template = st.file_uploader("Upload Simplex invoice template", type=["docx"])
+        st.caption("Leave empty to use the bundled default template, located in the downloaded folder as `simplex_invoice_template.docx`.")
+        use_ocr = st.checkbox("Use OCR for scanned PDFs", value=True)
+        st.markdown("---")
+        st.header("User Entry Required")
+        invoice_date_obj = st.date_input("Invoice date", value=date.today())
+        sales_rep_default = st.text_input("Sales rep", value="William Shiu")
+        st.caption("Invoice date and sales rep apply to every uploaded PDF. Shipping date, internal order number, shipping cost, and FedEx tracking are entered per PDF on the right.")
+        st.markdown("---")
+        sender = dict(SENDER_DEFAULTS)
+        with st.expander("Simplex sender/payment info", expanded=True):
+            for key, default in SENDER_DEFAULTS.items():
+                label = key.replace("_", " ").title()
+                if "address" in key:
+                    sender[key] = st.text_area(label, value=default, key=f"sender-{key}")
+                else:
+                    sender[key] = st.text_input(label, value=default, key=f"sender-{key}")
+
+    pdf_files = st.file_uploader("Upload Thermo Fisher purchase order PDF", type=["pdf"], accept_multiple_files=True)
+
+    if not pdf_files:
+        st.stop()
+
+    reviewed_ack = st.checkbox("I understand that OCR can be incorrect and that I must review the final Word document before sending.")
+    if not reviewed_ack:
+        st.caption("Tick the acknowledgement above to enable invoice downloads.")
+    template_bytes = uploaded_template.getvalue() if uploaded_template else DEFAULT_TEMPLATE.read_bytes()
+    all_generated: dict[str, bytes] = {}
+
+    overall_progress = st.progress(0.0, text="Preparing to process uploaded POs")
+    total_pdfs = len(pdf_files)
+
+    for idx, pdf in enumerate(pdf_files):
+        st.divider()
+        st.subheader(f"{idx + 1}. {pdf.name}")
+        file_bytes = pdf.read()
+        overall_progress.progress(idx / max(total_pdfs, 1), text=f"Processing {idx + 1} of {total_pdfs}: {pdf.name}")
+        with st.spinner(f"Reading and OCR-parsing {pdf.name}"):
+            text, rotation = extract_text_from_pdf(file_bytes, enable_ocr=use_ocr)
+            parsed = parse_thermofisher_po(text, pdf.name, file_bytes=file_bytes, rotation=rotation)
+        data = asdict(parsed)
+        data["ocr_rotation_used"] = rotation
+        data["issue_date"] = invoice_date_obj.isoformat()
+        data["sales_rep"] = sales_rep_default
+
+        with st.expander("User Entry Required for this PDF", expanded=True):
+            u1, u2, u3, u4 = st.columns(4)
+            with u1:
+                per_shipping_date_obj = st.date_input("Shipping date", value=date.today(), key=f"shipping-date-{idx}")
+            with u2:
+                per_internal_order_number = st.text_input("Internal order number", value="FS", key=f"internal-order-{idx}")
+            with u3:
+                per_shipping_cost = st.text_input("Shipping cost", value="", key=f"shipping-cost-{idx}")
+            with u4:
+                per_tracking_number = st.text_input("FedEx tracking number", value="", key=f"tracking-number-{idx}")
+
+        data["shipping_date"] = per_shipping_date_obj.isoformat()
+        data["order_number"] = per_internal_order_number
+        data["tracking_number"] = per_tracking_number
+
+        col1, col2 = st.columns([0.95, 1.05])
+        with col1:
+            st.markdown("**Order and invoice fields**")
+            edited = {}
+            for key in ["invoice_issued_to", "customer_po_number", "bill_to", "ship_to", "currency"]:
+                label = key.replace("_", " ").title()
+                if key == "customer_po_number":
+                    label = "Customer PO Number (from Fisher Scientific Order Number; expected DR...)"
+                if key in {"bill_to", "ship_to"}:
+                    edited[key] = st.text_area(label, value=data.get(key, ""), height=105, key=f"{idx}-{key}")
+                else:
+                    edited[key] = st.text_input(label, value=data.get(key, ""), key=f"{idx}-{key}")
+            current_po = str(edited.get("customer_po_number", "")).strip()
+            if current_po and not current_po.upper().startswith("DR"):
+                st.warning("Customer PO should be the DR-prefixed value beside Fisher Scientific Order Number. Please review this field before export.")
+
+        with col2:
+            st.markdown("**Product lines**")
+            df = pd.DataFrame(data.get("line_items") or [], columns=["quantity", "item", "unit_price", "amount"])
+            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"items-{idx}")
+            st.caption(f"Document recognition source: {rotation}")
+            with st.expander("Raw extracted text"):
+                st.text_area("Raw text", value=text[:20000], height=320, key=f"raw-{idx}")
+
+        line_items = edited_df.fillna("").to_dict(orient="records")
+        final_invoice = {**data, **edited, "line_items": line_items}
+        # Manual sidebar fields are authoritative. This prevents stale Streamlit
+        # review-field state from keeping old template dates/rep/tracking values.
+        final_invoice["issue_date"] = invoice_date_obj.isoformat()
+        final_invoice["shipping_date"] = per_shipping_date_obj.isoformat()
+        final_invoice["sales_rep"] = sales_rep_default
+        final_invoice["order_number"] = per_internal_order_number
+        final_invoice["tracking_number"] = per_tracking_number
+        context = build_context(sender, final_invoice, per_shipping_cost)
+
+        try:
+            with st.spinner(f"Generating Word invoice for {pdf.name}"):
+                docx_bytes = generate_docx(template_bytes, context)
+            output_name = f"{safe_filename(final_invoice.get('customer_po_number') or final_invoice.get('order_number') or pdf.name)}_simplex_invoice.docx"
+            all_generated[output_name] = docx_bytes
+            st.download_button(
+                "Download this Word invoice",
+                docx_bytes,
+                file_name=output_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"download-{idx}",
+                disabled=not reviewed_ack,
+            )
+        except Exception as exc:
+            st.error(f"Could not generate invoice for {pdf.name}: {exc}")
+
+    overall_progress.empty()
+
+    if all_generated:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for filename, content in all_generated.items():
+                zf.writestr(filename, content)
+        st.markdown("---")
+        st.download_button("Download all generated invoices as ZIP", zip_buffer.getvalue(), file_name="generated_simplex_invoices.zip", mime="application/zip", disabled=not reviewed_ack)
+
+
+if __name__ == "__main__":
+    main()
